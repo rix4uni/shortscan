@@ -43,6 +43,13 @@ You can also specify a file containing a list of URLs to be scanned:
 $ shortscan @urls.txt
 ```
 
+Or pipe newline-delimited URLs directly via stdin:
+
+```
+$ echo "https://example.org" | shortscan
+$ cat urls.txt | shortscan
+```
+
 ### Examples
 
 This example sets multiple custom headers by using `--header`/`-H` multiple times:
@@ -55,16 +62,22 @@ To check whether a site is vulnerable without performing file enumeration use:
 shortscan --isvuln
 ```
 
+To emit structured, pretty-printed JSON (one aggregate object per URL) and scan multiple URLs in parallel:
+```
+cat urls.txt | shortscan -o json --parallel 10
+```
+(`--parallel` is only applied for `-o json`; human/compact output runs serially for readability.)
+
 ### Advanced features
 
 The following options allow further tweaks:
 
 ```
 🌀 Shortscan v0.9.2 · an IIS short filename enumeration tool by bitquark
-Usage: main [--wordlist FILE] [--header HEADER] [--concurrency CONCURRENCY] [--timeout SECONDS] [--output format] [--verbosity VERBOSITY] [--fullurl] [--norecurse] [--stabilise] [--patience LEVEL] [--characters CHARACTERS] [--autocomplete mode] [--isvuln] URL [URL ...]
+Usage: main [--wordlist FILE] [--header HEADER] [--concurrency CONCURRENCY] [--timeout SECONDS] [--output format] [--verbosity VERBOSITY] [--fullurl] [--norecurse] [--stabilise] [--patience LEVEL] [--characters CHARACTERS] [--autocomplete mode] [--isvuln] [URL [URL ...]]
 
 Positional arguments:
-  URL                    url to scan (multiple URLs can be provided; a file containing URLs can be specified with an «at» prefix, for example: @urls.txt)
+  URL                    url to scan (multiple URLs can be provided; a file containing URLs can be specified with an «at» prefix, for example: @urls.txt). If omitted, URLs are read from stdin.
 
 Options:
   --wordlist FILE, -w FILE
@@ -76,7 +89,7 @@ Options:
   --timeout SECONDS, -t SECONDS
                          per-request timeout in seconds [default: 10]
   --output format, -o format
-                         output format (human = human readable; json = JSON) [default: human]
+                         output format (human = human readable; json = pretty JSON aggregate per URL; compact = grouped text) [default: human]
   --verbosity VERBOSITY, -v VERBOSITY
                          how much noise to make (0 = quiet; 1 = debug; 2 = trace) [default: 0]
   --fullurl, -F          display the full URL for confirmed files rather than just the filename [default: false]
@@ -89,6 +102,7 @@ Options:
   --autocomplete mode, -a mode
                          autocomplete detection mode (auto = autoselect; method = HTTP method magic; status = HTTP status; distance = Levenshtein distance; none = disable) [default: auto]
   --isvuln, -V           bail after determining whether the service is vulnerable [default: false]
+  --parallel PARALLEL    number of URLs to scan in parallel (applies to -o json only) [default: 10]
   --help, -h             display this help and exit
   --version              display version and exit
 ```

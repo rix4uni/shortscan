@@ -8,26 +8,29 @@
 package shortscan
 
 import (
-	"os"
-	"fmt"
-	"sync"
-	"time"
 	"bufio"
-	"embed"
-	"regexp"
-	"strings"
-	"math/rand"
 	"crypto/tls"
+	"embed"
 	"encoding/json"
+	"fmt"
+	"io"
+	"math/rand"
 	"net/http"
 	"net/http/httputil"
-	"github.com/fatih/color"
+	nurl "net/url"
+	"os"
+	"regexp"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
 	"github.com/alexflint/go-arg"
+	"github.com/bitquark/shortscan/pkg/levenshtein"
 	"github.com/bitquark/shortscan/pkg/maths"
 	"github.com/bitquark/shortscan/pkg/shortutil"
-	"github.com/bitquark/shortscan/pkg/levenshtein"
+	"github.com/fatih/color"
 	log "github.com/sirupsen/logrus"
-	nurl "net/url"
 )
 
 type baseRequest struct {
@@ -77,9 +80,12 @@ type attackConfig struct {
 	extChars          map[string]string
 	foundFiles        map[string]struct{}
 	foundDirectories  []string
-	wordlist          wordlistConfig
+	wordlist          *wordlistConfig
 	distanceMutex     sync.Mutex
 	autocompleteMutex sync.Mutex
+	findings          *int32
+	outputMutex       sync.Mutex
+	agg               *aggregateOutput
 }
 
 type resultOutput struct {
@@ -106,6 +112,17 @@ type statsOutput struct {
 	Retries       int    `json:"retries"`
 	SentBytes     int    `json:"sentbytes"`
 	ReceivedBytes int    `json:"receivedbytes"`
+}
+
+// aggregateOutput groups the results for a single URL when JSON output is requested
+type aggregateOutput struct {
+	Type         string         `json:"type"`
+	Url          string         `json:"url"`
+	Server       string         `json:"server"`
+	Vulnerable   bool           `json:"vulnerable"`
+	FindingCount int            `json:"findingCount"`
+	Directories  []string       `json:"directories,omitempty"`
+	Findings     []resultOutput `json:"findings,omitempty"`
 }
 
 // Version, rainbow table magic, default character set
@@ -138,7 +155,7 @@ var checksumRegex *regexp.Regexp
 
 // Command-line arguments and help
 type arguments struct {
-	Urls         []string `arg:"positional,required" help:"url to scan (multiple URLs can be provided; a file containing URLs can be specified with an «at» prefix, for example: @urls.txt)" placeholder:"URL"`
+	Urls         []string `arg:"positional" help:"url to scan (multiple URLs can be provided; a file containing URLs can be specified with an «at» prefix, for example: @urls.txt). If omitted, URLs are read from stdin." placeholder:"URL"`
 	Wordlist     string   `arg:"-w" help:"combined wordlist + rainbow table generated with shortutil" placeholder:"FILE"`
 	Headers      []string `arg:"--header,-H,separate" help:"header to send with each request (use multiple times for multiple headers)"`
 	Concurrency  int      `arg:"-c" help:"number of requests to make at once" default:"20"`
@@ -152,6 +169,7 @@ type arguments struct {
 	Characters   string   `arg:"-C" help:"filename characters to enumerate" default:"JFKGOTMYVHSPCANDXLRWEBQUIZ8549176320-_()&'!#$%@^{}~"`
 	Autocomplete string   `arg:"-a" help:"autocomplete detection mode (auto = autoselect; method = HTTP method magic; status = HTTP status; distance = Levenshtein distance; none = disable)" placeholder:"mode" default:"auto"`
 	IsVuln       bool     `arg:"-V" help:"bail after determining whether the service is vulnerable" default:"false"`
+	Parallel     int      `arg:"--parallel" help:"number of URLs to scan in parallel" default:"10"`
 }
 
 func (arguments) Version() string {
@@ -487,10 +505,25 @@ func enumerate(sem chan struct{}, wg *sync.WaitGroup, hc *http.Client, st *httpS
 								fp = strings.Replace(fn+fe, "?", color.HiBlackString("?"), -1)
 							}
 							printHuman(fmt.Sprintf("%-20s %-28s %s", br.file+br.tilde+br.ext, fp, ff))
+							if ac.findings != nil {
+								atomic.AddInt32(ac.findings, 1)
+							}
+
+						} else if args.Output == "compact" {
+
+							short := br.file + br.tilde + br.ext
+							if fnr != "" {
+								printCompact("-", short, "=>", fnr)
+							} else {
+								printCompact("-", short)
+							}
+							if ac.findings != nil {
+								atomic.AddInt32(ac.findings, 1)
+							}
 
 						} else {
 
-							// Output JSON result if requested
+							// Build JSON result (appended later for aggregate output)
 							o := resultOutput{
 								Type:      "result",
 								FullMatch: fnr != "",
@@ -501,7 +534,16 @@ func enumerate(sem chan struct{}, wg *sync.WaitGroup, hc *http.Client, st *httpS
 								Partname:  fn + fe,
 								Fullname:  fnr,
 							}
-							printJSON(o)
+							if ac.agg != nil {
+								ac.outputMutex.Lock()
+								ac.agg.Findings = append(ac.agg.Findings, o)
+								ac.outputMutex.Unlock()
+								if ac.findings != nil {
+									atomic.AddInt32(ac.findings, 1)
+								}
+							} else {
+								printJSON(o)
+							}
 
 						}
 
@@ -771,21 +813,83 @@ func printHuman(s ...any) {
 // printJSON prints JSON formatted output if enabled
 func printJSON(o any) {
 	if args.Output == "json" {
-		j, _ := json.Marshal(o)
+		j, _ := json.MarshalIndent(o, "", "  ")
 		fmt.Println(string(j))
 	}
 }
 
-// Scan starts enumeration of the given URL
-func Scan(urls []string, hc *http.Client, st *httpStats, wc wordlistConfig, mk markers) {
+// printCompact prints when compact output is selected
+func printCompact(s ...any) {
+	if args.Output == "compact" {
+		fmt.Println(s...)
+	}
+}
 
-	// Loop through each URL
-	for len(urls) > 0 {
+// readURLsFromReader returns newline-delimited URLs from the provided reader, skipping blanks
+func readURLsFromReader(r io.Reader) ([]string, error) {
+	var urls []string
+	sc := bufio.NewScanner(r)
+	for sc.Scan() {
+		line := strings.TrimSpace(sc.Text())
+		if line == "" {
+			continue
+		}
+		urls = append(urls, line)
+	}
+	if err := sc.Err(); err != nil {
+		return nil, err
+	}
+	return urls, nil
+}
 
-		// Pop off a URL
-		var url string
-		url, urls = urls[0], urls[1:]
-		url = strings.TrimSuffix(url, "/") + "/"
+// buildURLList expands positional URL inputs (including @file support) into a concrete list
+func buildURLList(inputs []string) ([]string, error) {
+	var urls []string
+	for _, raw := range inputs {
+		url := strings.TrimSpace(raw)
+		if url == "" {
+			continue
+		}
+		if strings.HasPrefix(url, "@") {
+			path := strings.TrimPrefix(url, "@")
+			fh, err := os.Open(path)
+			if err != nil {
+				return nil, fmt.Errorf("unable to open URL list file %s: %w", path, err)
+			}
+			sc := bufio.NewScanner(fh)
+			for sc.Scan() {
+				line := strings.TrimSpace(sc.Text())
+				if line == "" {
+					continue
+				}
+				urls = append(urls, line)
+			}
+			if err := sc.Err(); err != nil {
+				fh.Close()
+				return nil, fmt.Errorf("error reading URL list file %s: %w", path, err)
+			}
+			fh.Close()
+			continue
+		}
+		urls = append(urls, url)
+	}
+	return urls, nil
+}
+
+// scanURL starts enumeration of the given URL (including recursion) and prints output
+func scanURL(url string, hc *http.Client, st *httpStats, wc *wordlistConfig) {
+
+	var findings int32
+	var agg aggregateOutput
+
+	// Local queues for recursion within this URL
+	todo := []string{strings.TrimSuffix(url, "/") + "/"}
+
+	// Loop through each URL in this recursion chain
+	for len(todo) > 0 {
+
+		var mk markers
+		url, todo = todo[0], todo[1:]
 
 		// Default to HTTPS if no protocol was supplied
 		if !strings.Contains(url, "://") {
@@ -821,6 +925,11 @@ func Scan(urls []string, hc *http.Client, st *httpStats, wc wordlistConfig, mk m
 			srv += " " + color.HiRedString("[!]")
 		}
 		printHuman(color.New(color.FgWhite, color.Bold).Sprint("Running")+":", srv)
+		printCompact("\nURL:", url)
+		printCompact("Running:", srv)
+		if args.Output == "json" {
+			agg = aggregateOutput{Type: "aggregate", Url: url, Server: srv}
+		}
 
 		// If autocomplete is in autoselect mode
 		if args.Autocomplete == "auto" {
@@ -843,6 +952,10 @@ func Scan(urls []string, hc *http.Client, st *httpStats, wc wordlistConfig, mk m
 
 		// Initialise attack config
 		ac := attackConfig{wordlist: wc}
+		ac.findings = &findings
+		if args.Output == "json" {
+			ac.agg = &agg
+		}
 
 		// Determine how many methods to try
 		var pc, mc int
@@ -855,11 +968,11 @@ func Scan(urls []string, hc *http.Client, st *httpStats, wc wordlistConfig, mk m
 		}
 
 		// Loop through path suffixes
-		outerEscape:
+	outerEscape:
 		for _, suffix := range pathSuffixes[:pc] {
 
 			// Loop through each method
-			methodEscape:
+		methodEscape:
 			for _, method := range httpMethods[:mc] {
 
 				// Make some requests for non-existent files
@@ -942,18 +1055,30 @@ func Scan(urls []string, hc *http.Client, st *httpStats, wc wordlistConfig, mk m
 		}
 
 		// Output JSON status if requested
-		printJSON(statusOutput{Type: "status", Url: url, Server: srv, Vulnerable: len(ac.tildes) > 0})
+		if args.Output != "json" {
+			printJSON(statusOutput{Type: "status", Url: url, Server: srv, Vulnerable: len(ac.tildes) > 0})
+		}
 
 		// Skip this URL if no tilde files could be identified :'(
 		if len(ac.tildes) == 0 {
 			printHuman(color.New(color.FgWhite, color.Bold).Sprint("Vulnerable:"), color.HiBlueString("No"), "(or no 8.3 files exist)")
 			printHuman("════════════════════════════════════════════════════════════════════════════════")
+			printCompact("Vulnerable: No (or no 8.3 files exist)")
+			printCompact("Findings: 0")
+			if args.Output == "json" {
+				agg.Vulnerable = false
+				printJSON(agg)
+			}
 			continue
 		}
 
 		// We are GO for second stage
 		printHuman(color.New(color.FgWhite, color.Bold).Sprint("Vulnerable:"), color.HiRedString("Yes!"))
 		printHuman("════════════════════════════════════════════════════════════════════════════════")
+		printCompact("Vulnerable: Yes!")
+		if args.Output == "json" {
+			agg.Vulnerable = true
+		}
 		log.WithFields(log.Fields{"method": ac.method, "suffix": ac.suffix, "statusPos": mk.statusPos, "statusNeg": mk.statusNeg}).Info("Found working options")
 		log.WithFields(log.Fields{"tildes": ac.tildes}).Info("Found tilde files")
 
@@ -1015,18 +1140,32 @@ func Scan(urls []string, hc *http.Client, st *httpStats, wc wordlistConfig, mk m
 
 		// Prepend discovered directories for processing next iteration
 		for i := len(ac.foundDirectories) - 1; i >= 0; i-- {
-			urls = append([]string{url + ac.foundDirectories[i] + "/"}, urls...)
+			todo = append([]string{url + ac.foundDirectories[i] + "/"}, todo...)
 		}
 
-		// <hr>
-		printHuman("════════════════════════════════════════════════════════════════════════════════")
+		// Summary
+		if args.Output == "human" {
+			printHuman(color.New(color.FgWhite, color.Bold).Sprint("Summary:"), fmt.Sprintf("Findings: %d; New directories: %d", atomic.LoadInt32(ac.findings), len(ac.foundDirectories)))
+			printHuman("════════════════════════════════════════════════════════════════════════════════")
+		}
+		if args.Output == "compact" {
+			printCompact(fmt.Sprintf("Findings: %d; New directories: %d", atomic.LoadInt32(ac.findings), len(ac.foundDirectories)))
+			printCompact("")
+		}
+		if args.Output == "json" {
+			agg.FindingCount = int(atomic.LoadInt32(ac.findings))
+			agg.Directories = append(agg.Directories, ac.foundDirectories...)
+			printJSON(agg)
+		}
 
 	}
 	printHuman()
 
 	// Fin
 	printHuman(fmt.Sprintf("%s Requests: %d; Retries: %d; Sent %d bytes; Received %d bytes", color.New(color.FgWhite, color.Bold).Sprint("Finished!"), st.requests, st.retries, st.bytesTx, st.bytesRx))
-	printJSON(statsOutput{Type: "statistics", Requests: st.requests, Retries: st.retries, SentBytes: st.bytesTx, ReceivedBytes: st.bytesRx})
+	if args.Output != "json" {
+		printJSON(statsOutput{Type: "statistics", Requests: st.requests, Retries: st.retries, SentBytes: st.bytesTx, ReceivedBytes: st.bytesRx})
+	}
 
 }
 
@@ -1043,43 +1182,37 @@ func Run() {
 		p.Fail("autocomplete must be one of: auto, status, method, none")
 	}
 	args.Output = strings.ToLower(args.Output)
-	if args.Output != "human" && args.Output != "json" {
-		p.Fail("output must be one of: human, json")
+	if args.Output != "human" && args.Output != "json" && args.Output != "compact" {
+		p.Fail("output must be one of: human, json, compact")
+	}
+	if args.Output != "json" {
+		args.Parallel = 1
+	}
+
+	// Gather positional URLs (or stdin if none were provided)
+	inputs := args.Urls
+	if len(inputs) == 0 {
+		stat, err := os.Stdin.Stat()
+		if err != nil {
+			log.WithFields(log.Fields{"err": err}).Fatal("Unable to stat stdin")
+		}
+		if (stat.Mode() & os.ModeCharDevice) != 0 {
+			p.Fail("no URLs provided; pass URLs as arguments or via stdin")
+		}
+		stdinUrls, err := readURLsFromReader(os.Stdin)
+		if err != nil {
+			log.WithFields(log.Fields{"err": err}).Fatal("Unable to read URLs from stdin")
+		}
+		inputs = append(inputs, stdinUrls...)
 	}
 
 	// Build the list of URLs to scan
-	var urls []string
-	for _, url := range args.Urls {
-
-		// If this is a filename rather than a URL
-		if strings.HasPrefix(url, "@") {
-
-			// Open the file
-			path := strings.TrimPrefix(url, "@")
-			fh, err := os.Open(path)
-			if err != nil {
-				log.WithFields(log.Fields{"path": path, "err": err}).Fatal("Unable to open URL list file")
-			}
-			defer fh.Close()
-
-			// Add each line to the URL list
-			sc := bufio.NewScanner(fh)
-			for sc.Scan() {
-				urls = append(urls, sc.Text())
-			}
-
-			// Check for file read errors
-			if err := sc.Err(); err != nil {
-				log.WithFields(log.Fields{"path": path, "err": err}).Fatal("Error reading URL list file")
-			}
-
-		} else {
-
-			// This is a plain URL, add it to the list
-			urls = append(urls, url)
-
-		}
-
+	urls, err := buildURLList(inputs)
+	if err != nil {
+		log.WithFields(log.Fields{"err": err}).Fatal("Unable to build URL list")
+	}
+	if len(urls) == 0 {
+		p.Fail("no URLs provided; pass URLs as arguments or via stdin")
 	}
 
 	// Say hello
@@ -1113,7 +1246,6 @@ func Run() {
 	}
 
 	// Initialise things
-	mk := markers{}
 	st := &httpStats{}
 	wc := wordlistConfig{}
 	statusCache = make(map[string]map[int]struct{})
@@ -1195,6 +1327,23 @@ func Run() {
 	}
 
 	// Let's go!
-	Scan(urls, hc, st, wc, mk)
+	if args.Parallel <= 0 {
+		args.Parallel = 1
+	}
+	sem := make(chan struct{}, args.Parallel)
+	wg := new(sync.WaitGroup)
+	for _, u := range urls {
+		wg.Add(1)
+		u := u
+		go func() {
+			sem <- struct{}{}
+			defer func() {
+				<-sem
+				wg.Done()
+			}()
+			scanURL(u, hc, st, &wc)
+		}()
+	}
+	wg.Wait()
 
 }
